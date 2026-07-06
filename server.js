@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const Anthropic = require("@anthropic-ai/sdk");
+const { Redis } = require("@upstash/redis");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,53 +12,119 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
+// ── Upstash Redis ─────────────────────────────────────────────────────────────
+// Falls back to in-memory if env vars are not set (local dev).
+let redis = null;
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  });
+  console.log("✅ Upstash Redis connected");
+} else {
+  console.warn("⚠️  Upstash env vars missing — using in-memory fallback");
+}
+
 // ── Topic cache ───────────────────────────────────────────────────────────────
-// Caches generated briefs so repeated lookups are instant (no LLM call).
-const topicCache = new Map(); // key: normalizedTopic → { brief, cachedAt }
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+// Redis key: brief:<normalizedTopic>  TTL: 24 hours
+// Falls back to an in-process Map when Redis is unavailable.
+const memCache = new Map();
+const CACHE_TTL_SECONDS = 24 * 60 * 60; // 24 hours
 
-function getCachedBrief(topic) {
-  const key = topic.toLowerCase().trim();
-  const entry = topicCache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.cachedAt > CACHE_TTL_MS) {
-    topicCache.delete(key);
-    return null;
+function cacheKey(topic) {
+  return `brief:${topic.toLowerCase().trim()}`;
+}
+
+async function getCachedBrief(topic) {
+  if (redis) {
+    const data = await redis.get(cacheKey(topic));
+    return data || null;
   }
-  return entry.brief;
+  const entry = memCache.get(cacheKey(topic));
+  return entry || null;
 }
 
-function cacheBrief(topic, brief) {
-  const key = topic.toLowerCase().trim();
-  topicCache.set(key, { brief, cachedAt: Date.now() });
+async function cacheBrief(topic, brief) {
+  if (redis) {
+    await redis.set(cacheKey(topic), brief, { ex: CACHE_TTL_SECONDS });
+  } else {
+    memCache.set(cacheKey(topic), brief);
+  }
 }
 
-// ── In-memory usage store ─────────────────────────────────────────────────────
-// { deviceId: { count: N, date: "YYYY-MM-DD" } }
-// In production, swap this for Redis or a database.
-const usageStore = new Map();
-
+// ── Usage store ───────────────────────────────────────────────────────────────
+// Redis key: usage:<deviceId>:<YYYY-MM-DD>  TTL: 25 hours (survives day rollover)
+// Falls back to in-process Map.
+const usageMemStore = new Map();
 const FREE_DAILY_LIMIT = 3;
 
 function getTodayStr() {
-  return new Date().toISOString().slice(0, 10); // "2026-05-08"
+  return new Date().toISOString().slice(0, 10);
 }
 
-function getUsage(deviceId) {
+async function getUsage(deviceId) {
   const today = getTodayStr();
-  const entry = usageStore.get(deviceId);
-  if (!entry || entry.date !== today) {
-    return { count: 0, date: today };
+  if (redis) {
+    const count = await redis.get(`usage:${deviceId}:${today}`);
+    return { count: count ? Number(count) : 0, date: today };
   }
+  const entry = usageMemStore.get(deviceId);
+  if (!entry || entry.date !== today) return { count: 0, date: today };
   return entry;
 }
 
-function incrementUsage(deviceId) {
-  const usage = getUsage(deviceId);
+async function incrementUsage(deviceId) {
+  const today = getTodayStr();
+  if (redis) {
+    const key = `usage:${deviceId}:${today}`;
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, 25 * 60 * 60); // expire after 25h
+    return { count, date: today };
+  }
+  const usage = await getUsage(deviceId);
   usage.count += 1;
-  usageStore.set(deviceId, usage);
+  usageMemStore.set(deviceId, usage);
   return usage;
 }
+
+// ── Hot-topic pre-seed ────────────────────────────────────────────────────────
+// On startup, generate briefs for popular topics if not already cached.
+// Runs in the background — does NOT block server startup.
+const HOT_TOPICS = [
+  "React", "TypeScript", "GraphQL", "Docker", "Kubernetes",
+  "REST API", "WebSockets", "JWT", "OAuth", "SQL vs NoSQL",
+  "Machine Learning", "Large Language Models", "Vector Databases",
+  "CI/CD", "Microservices", "Serverless", "Redis", "PostgreSQL",
+  "Swift", "SwiftUI",
+];
+
+async function preSeedHotTopics() {
+  if (!redis) return; // skip in local dev
+  const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  for (const topic of HOT_TOPICS) {
+    try {
+      const existing = await getCachedBrief(topic);
+      if (existing) continue; // already cached
+
+      const message = await anthropicClient.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 2000,
+        messages: [{ role: "user", content: makePrompt(topic) }],
+      });
+      const text = message.content[0]?.type === "text" ? message.content[0].text : "";
+      const cleaned = text.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
+      const brief = JSON.parse(cleaned);
+      await cacheBrief(topic, brief);
+      console.log(`🌱 Pre-seeded: ${topic}`);
+    } catch (err) {
+      console.warn(`⚠️  Pre-seed failed for "${topic}":`, err.message);
+    }
+  }
+  console.log("✅ Hot-topic pre-seed complete");
+}
+
+// Kick off pre-seed after a short delay so the server is ready first
+setTimeout(() => preSeedHotTopics().catch(console.error), 5000);
 
 // ── Anthropic client ──────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -102,16 +169,16 @@ app.get("/health", (req, res) => {
 });
 
 // Usage check — lets the app show "X of 3 free briefs used today"
-app.get("/api/usage", (req, res) => {
+app.get("/api/usage", async (req, res) => {
   const deviceId = req.headers["x-device-id"];
   if (!deviceId) return res.status(400).json({ error: "Missing x-device-id header" });
 
-  const usage = getUsage(deviceId);
+  const usage = await getUsage(deviceId);
   res.json({
     used: usage.count,
     limit: FREE_DAILY_LIMIT,
     remaining: Math.max(0, FREE_DAILY_LIMIT - usage.count),
-    isPro: false, // extend this when you add subscriptions
+    isPro: false,
     resetsAt: getTodayStr() + "T00:00:00Z",
   });
 });
@@ -134,7 +201,7 @@ app.post("/api/generate", async (req, res) => {
   }
 
   // ── Rate limit check ────────────────────────────────────────────────────────
-  const usage = getUsage(deviceId);
+  const usage = await getUsage(deviceId);
   const isPro = req.headers["x-is-pro"] === "true";
 
   if (!isPro && usage.count >= FREE_DAILY_LIMIT) {
@@ -152,9 +219,9 @@ app.post("/api/generate", async (req, res) => {
   }
 
   // ── Cache hit — instant response ─────────────────────────────────────────────
-  const cached = getCachedBrief(topic.trim());
+  const cached = await getCachedBrief(topic.trim());
   if (cached) {
-    const newUsage = incrementUsage(deviceId);
+    const newUsage = await incrementUsage(deviceId);
     if (wantsStream) {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
@@ -190,8 +257,8 @@ app.post("/api/generate", async (req, res) => {
 
       const cleaned = fullText.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
       const brief = JSON.parse(cleaned);
-      cacheBrief(topic.trim(), brief);
-      const newUsage = incrementUsage(deviceId);
+      await cacheBrief(topic.trim(), brief);
+      const newUsage = await incrementUsage(deviceId);
 
       res.write(`data: ${JSON.stringify({ status: "complete", brief, usage: usagePayload(newUsage), cached: false })}\n\n`);
       return res.end();
@@ -213,8 +280,8 @@ app.post("/api/generate", async (req, res) => {
     const text = message.content[0]?.type === "text" ? message.content[0].text : "";
     const cleaned = text.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
     const brief = JSON.parse(cleaned);
-    cacheBrief(topic.trim(), brief);
-    const newUsage = incrementUsage(deviceId);
+    await cacheBrief(topic.trim(), brief);
+    const newUsage = await incrementUsage(deviceId);
 
     res.json({ brief, usage: usagePayload(newUsage) });
   } catch (err) {
