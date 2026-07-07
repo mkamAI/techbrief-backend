@@ -98,67 +98,68 @@ const HOT_TOPICS = [
   "Swift", "SwiftUI",
 ];
 
-async function preSeedHotTopics() {
-  if (!redis) return; // skip in local dev
-  const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  for (const topic of HOT_TOPICS) {
-    try {
-      const existing = await getCachedBrief(topic);
-      if (existing) continue; // already cached
-
-      const message = await anthropicClient.messages.create({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 2000,
-        messages: [{ role: "user", content: makePrompt(topic) }],
-      });
-      const text = message.content[0]?.type === "text" ? message.content[0].text : "";
-      const cleaned = text.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
-      const brief = JSON.parse(cleaned);
-      await cacheBrief(topic, brief);
-      console.log(`🌱 Pre-seeded: ${topic}`);
-    } catch (err) {
-      console.warn(`⚠️  Pre-seed failed for "${topic}":`, err.message);
-    }
+// Seed a single topic in the background (fire-and-forget, called after first real request)
+async function seedTopicInBackground(topic) {
+  if (!redis) return;
+  try {
+    const existing = await getCachedBrief(topic);
+    if (existing) return;
+    const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const message = await anthropicClient.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 700,
+      messages: [{ role: "user", content: makePrompt(topic) }],
+    });
+    const text = message.content[0]?.type === "text" ? message.content[0].text : "";
+    const cleaned = text.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
+    await cacheBrief(topic, JSON.parse(cleaned));
+    console.log(`🌱 Cached: ${topic}`);
+  } catch (err) {
+    console.warn(`⚠️  Seed failed for "${topic}":`, err.message);
   }
-  console.log("✅ Hot-topic pre-seed complete");
 }
 
-// Kick off pre-seed after a short delay so the server is ready first
-setTimeout(() => preSeedHotTopics().catch(console.error), 5000);
+// Called after each generate request completes — seeds the next uncached hot topic.
+// This piggybacks on real traffic so it works on serverless (no background processes needed).
+let seedIndex = 0;
+function seedNextHotTopic() {
+  if (!redis) return;
+  const topic = HOT_TOPICS[seedIndex % HOT_TOPICS.length];
+  seedIndex++;
+  seedTopicInBackground(topic).catch(() => {});
+}
 
 // ── Anthropic client ──────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ── Prompt ────────────────────────────────────────────────────────────────────
 function makePrompt(topic) {
-  return `You are a senior software engineer writing a concise tech brief for developers.
-Generate a JSON object (no markdown, raw JSON only) for the topic: "${topic}"
+  return `You are a senior software engineer. Generate a concise tech brief as raw JSON (no markdown) for: "${topic}"
 
-The JSON must exactly match this structure:
+Exact structure required:
 {
   "topic": "exact topic name",
-  "tagline": "one punchy sentence (max 10 words) capturing why this matters",
-  "what_is_it": "2-3 sentences, plain English, no jargon",
-  "why_it_matters": "2-3 sentences explaining the problem it solves",
+  "tagline": "one punchy sentence, max 8 words",
+  "what_is_it": "1-2 sentences, plain English",
+  "why_it_matters": "1-2 sentences, the core problem it solves",
   "concepts": [
-    {"term": "Term Name", "definition": "one clear sentence"},
-    (6-8 concepts total)
+    {"term": "Term", "definition": "one sentence"},
+    (exactly 4 concepts)
   ],
-  "use_when": ["short phrase 1", "short phrase 2", "short phrase 3", "short phrase 4"],
-  "avoid_when": ["short phrase 1", "short phrase 2", "short phrase 3", "short phrase 4"],
-  "code_comment": "one sentence describing what the code example shows",
-  "code_lines": ["line1", "line2", ... up to 18 lines of real, runnable code with comments],
+  "use_when": ["phrase 1", "phrase 2", "phrase 3"],
+  "avoid_when": ["phrase 1", "phrase 2", "phrase 3"],
+  "code_comment": "one sentence describing the example",
+  "code_lines": ["line1", "line2", ... 6-8 lines of real runnable code],
   "youtube_links": [
-    {"title": "Video Title", "channel": "Channel Name", "duration": "X min", "url": "youtube.com/watch?v=REAL_ID"},
-    (3-4 videos, real videos that exist, under 15 min each)
+    {"title": "Video Title", "channel": "Channel Name", "duration": "X min", "url": "youtube.com/watch?v=REAL_ID"}
   ],
   "learn_next": [
-    {"topic": "Topic Name", "description": "one sentence on why to learn it next"},
-    (3 topics)
+    {"topic": "Topic", "description": "one sentence on why"},
+    (exactly 3 topics)
   ]
 }
 
-Return ONLY the raw JSON. No markdown code fences, no explanation.`;
+Return ONLY raw JSON. No markdown, no explanation.`;
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -245,7 +246,7 @@ app.post("/api/generate", async (req, res) => {
       let fullText = "";
       const stream = anthropic.messages.stream({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 2000,
+        max_tokens: 700,
         messages: [{ role: "user", content: makePrompt(topic.trim()) }],
       });
 
@@ -261,7 +262,9 @@ app.post("/api/generate", async (req, res) => {
       const newUsage = await incrementUsage(deviceId);
 
       res.write(`data: ${JSON.stringify({ status: "complete", brief, usage: usagePayload(newUsage), cached: false })}\n\n`);
-      return res.end();
+      res.end();
+      seedNextHotTopic(); // warm the next hot topic after responding
+      return;
     } catch (err) {
       console.error("[/api/generate SSE]", err.message);
       res.write(`data: ${JSON.stringify({ status: "error", message: err instanceof SyntaxError ? "Failed to parse response. Try again." : (err.message || "Internal server error") })}\n\n`);
@@ -273,7 +276,7 @@ app.post("/api/generate", async (req, res) => {
   try {
     const message = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 2000,
+      max_tokens: 700,
       messages: [{ role: "user", content: makePrompt(topic.trim()) }],
     });
 
@@ -284,6 +287,7 @@ app.post("/api/generate", async (req, res) => {
     const newUsage = await incrementUsage(deviceId);
 
     res.json({ brief, usage: usagePayload(newUsage) });
+    seedNextHotTopic();
   } catch (err) {
     console.error("[/api/generate]", err.message);
     if (err instanceof SyntaxError) {
