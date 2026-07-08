@@ -115,12 +115,11 @@ async function seedTopicInBackground(topic) {
     const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const message = await anthropicClient.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 700,
+      max_tokens: 1000,
       messages: [{ role: "user", content: makePrompt(topic) }],
     });
     const text = message.content[0]?.type === "text" ? message.content[0].text : "";
-    const cleaned = text.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
-    await cacheBrief(topic, JSON.parse(cleaned));
+    await cacheBrief(topic, extractJSON(text));
     console.log(`🌱 Cached: ${topic}`);
   } catch (err) {
     console.warn(`⚠️  Seed failed for "${topic}":`, err.message);
@@ -168,6 +167,16 @@ Exact structure required:
 }
 
 Return ONLY raw JSON. No markdown, no explanation.`;
+}
+
+// ── JSON extraction ───────────────────────────────────────────────────────────
+// Finds the first complete {...} object in the text — handles markdown fences,
+// preamble text, and any trailing content Claude might add.
+function extractJSON(text) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) throw new SyntaxError("No JSON object found");
+  return JSON.parse(text.slice(start, end + 1));
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -254,7 +263,7 @@ app.post("/api/generate", async (req, res) => {
       let fullText = "";
       const stream = anthropic.messages.stream({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 700,
+        max_tokens: 1000,
         messages: [{ role: "user", content: makePrompt(topic.trim()) }],
       });
 
@@ -264,8 +273,7 @@ app.post("/api/generate", async (req, res) => {
         }
       }
 
-      const cleaned = fullText.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
-      const brief = JSON.parse(cleaned);
+      const brief = extractJSON(fullText);
       await cacheBrief(topic.trim(), brief);
       const newUsage = await incrementUsage(deviceId);
 
@@ -284,13 +292,12 @@ app.post("/api/generate", async (req, res) => {
   try {
     const message = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 700,
+      max_tokens: 1000,
       messages: [{ role: "user", content: makePrompt(topic.trim()) }],
     });
 
     const text = message.content[0]?.type === "text" ? message.content[0].text : "";
-    const cleaned = text.trim().replace(/^```json\s*/m, "").replace(/\s*```$/m, "").trim();
-    const brief = JSON.parse(cleaned);
+    const brief = extractJSON(text);
     await cacheBrief(topic.trim(), brief);
     const newUsage = await incrementUsage(deviceId);
 
