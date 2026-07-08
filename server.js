@@ -35,21 +35,29 @@ function cacheKey(topic) {
   return `brief:${topic.toLowerCase().trim()}`;
 }
 
-async function getCachedBrief(topic) {
-  if (redis) {
-    const data = await redis.get(cacheKey(topic));
-    return data || null;
+// Wrap any Redis call with a 2s timeout — falls back to null on timeout/error
+async function redisWithTimeout(fn) {
+  if (!redis) return null;
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Redis timeout")), 2000)),
+    ]);
+  } catch (err) {
+    console.warn("⚠️  Redis skipped:", err.message);
+    return null;
   }
-  const entry = memCache.get(cacheKey(topic));
-  return entry || null;
+}
+
+async function getCachedBrief(topic) {
+  const data = await redisWithTimeout(() => redis.get(cacheKey(topic)));
+  if (data) return data;
+  return memCache.get(cacheKey(topic)) || null;
 }
 
 async function cacheBrief(topic, brief) {
-  if (redis) {
-    await redis.set(cacheKey(topic), brief, { ex: CACHE_TTL_SECONDS });
-  } else {
-    memCache.set(cacheKey(topic), brief);
-  }
+  memCache.set(cacheKey(topic), brief); // always update in-memory
+  redisWithTimeout(() => redis.set(cacheKey(topic), brief, { ex: CACHE_TTL_SECONDS })).catch(() => {});
 }
 
 // ── Usage store ───────────────────────────────────────────────────────────────
@@ -64,10 +72,8 @@ function getTodayStr() {
 
 async function getUsage(deviceId) {
   const today = getTodayStr();
-  if (redis) {
-    const count = await redis.get(`usage:${deviceId}:${today}`);
-    return { count: count ? Number(count) : 0, date: today };
-  }
+  const count = await redisWithTimeout(() => redis.get(`usage:${deviceId}:${today}`));
+  if (count !== null) return { count: Number(count), date: today };
   const entry = usageMemStore.get(deviceId);
   if (!entry || entry.date !== today) return { count: 0, date: today };
   return entry;
@@ -75,12 +81,14 @@ async function getUsage(deviceId) {
 
 async function incrementUsage(deviceId) {
   const today = getTodayStr();
-  if (redis) {
-    const key = `usage:${deviceId}:${today}`;
+  const key = `usage:${deviceId}:${today}`;
+  const redisCount = await redisWithTimeout(async () => {
     const count = await redis.incr(key);
-    if (count === 1) await redis.expire(key, 25 * 60 * 60); // expire after 25h
-    return { count, date: today };
-  }
+    if (count === 1) await redis.expire(key, 25 * 60 * 60);
+    return count;
+  });
+  if (redisCount !== null) return { count: redisCount, date: today };
+  // fallback to in-memory
   const usage = await getUsage(deviceId);
   usage.count += 1;
   usageMemStore.set(deviceId, usage);
