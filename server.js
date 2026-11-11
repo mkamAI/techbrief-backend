@@ -85,12 +85,13 @@ app.get("/api/usage", (req, res) => {
   const deviceId = req.headers["x-device-id"];
   if (!deviceId) return res.status(400).json({ error: "Missing x-device-id header" });
 
+  const isPro = req.headers["x-is-pro"] === "true";
   const usage = getUsage(deviceId);
   res.json({
     used: usage.count,
     limit: FREE_DAILY_LIMIT,
-    remaining: Math.max(0, FREE_DAILY_LIMIT - usage.count),
-    isPro: false, // extend this when you add subscriptions
+    remaining: isPro ? FREE_DAILY_LIMIT : Math.max(0, FREE_DAILY_LIMIT - usage.count),
+    isPro,
     resetsAt: getTodayStr() + "T00:00:00Z",
   });
 });
